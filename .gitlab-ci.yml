@@ -26,8 +26,19 @@ variables:
   PRODUCTION_URL: "https://example.com"
   # Speed up docker builds with the GitLab registry as build cache
   DOCKER_BUILDKIT: "1"
-  # Don't create an unused anonymous volume for the dind service
-  DOCKER_TLS_CERTDIR: "/certs"
+  # --- Docker-in-Docker (dind) TLS configuration -----------------------------
+  # The docker:*-dind service generates TLS certs and listens on port 2376.
+  # Without these variables the docker client tries plain tcp://docker:2375
+  # and fails with "Cannot connect to the Docker daemon".
+  DOCKER_HOST: "tcp://docker:2376"
+  DOCKER_TLS_CERTDIR: "/certs"          # shared volume for the certs
+  DOCKER_TLS_VERIFY: "1"                # verify the daemon's certificate
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  # NOTE: dind requires a runner with `privileged = true` in config.toml.
+  # If your runner is NOT privileged, use kaniko or buildah instead (see the
+  # commented example in the 'build-docker-image' job below).
+  # Some Kubernetes runners expose services on localhost instead of the
+  # service name — in that case use DOCKER_HOST: "tcp://localhost:2376".
 
 # -----------------------------------------------------------------------------
 # DEFAULT SETTINGS — applied to every job unless overridden
@@ -252,6 +263,12 @@ build-docker-image:
   before_script:
     - echo "Logging into GitLab Container Registry..."
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  # ALTERNATIVE for non-privileged runners (kaniko — no daemon needed):
+  # image:
+  #   name: gcr.io/kaniko-project/executor:debug
+  #   entrypoint: [""]
+  # script:
+  #   - /kaniko/executor --context . --destination $IMAGE_NAME:$IMAGE_TAG
   script:
     - echo "Building Docker image $IMAGE_NAME:$IMAGE_TAG ..."
     - 'echo "Real command: docker build --pull -t \$IMAGE_NAME:\$IMAGE_TAG -t \$IMAGE_NAME:latest ."'
