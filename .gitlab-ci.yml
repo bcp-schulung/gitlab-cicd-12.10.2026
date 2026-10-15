@@ -1,0 +1,606 @@
+stages:
+  - pre-check
+  - security
+  - lint
+  - build
+  - test
+  - release
+  - deploy-staging
+  - deploy-prod
+  - smoke
+  - performance
+  - rollback
+  - notify
+
+# -----------------------------------------------------------------------------
+# GLOBAL VARIABLES
+# Available in every job. Sensitive values (tokens, passwords) should be
+# defined in the GitLab UI under Settings > CI/CD > Variables (masked/protected)
+# -----------------------------------------------------------------------------
+variables:
+  # Image naming used across build/release/deploy jobs
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  # URLs of the two environments (used by deploy/smoke/rollback jobs)
+  STAGING_URL: "https://staging.example.com"
+  PRODUCTION_URL: "https://example.com"
+  # Speed up docker builds with the GitLab registry as build cache
+  DOCKER_BUILDKIT: "1"
+  # Don't create an unused anonymous volume for the dind service
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# -----------------------------------------------------------------------------
+# DEFAULT SETTINGS — applied to every job unless overridden
+# -----------------------------------------------------------------------------
+default:
+  # Base image: alpine is tiny; jobs that need docker override this.
+  image: alpine:3.21
+  # Retry failed jobs up to 2 times on runner/system failures
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  # Everything echoes pre-run, useful for debugging
+  before_script:
+    - echo "================================================"
+    - 'echo "Job:        $CI_JOB_NAME"'
+    - 'echo "Stage:      $CI_JOB_STAGE"'
+    - 'echo "Pipeline:   $CI_PIPELINE_URL"'
+    - 'echo "Commit:     $CI_COMMIT_SHORT_SHA ($CI_COMMIT_REF_SLUG)"'
+    - 'echo "Author:     $GITLAB_USER_LOGIN"'
+    - 'echo "Runner:     $RUNNER_DESCRIPTION"'
+    - echo "================================================"
+
+# =============================================================================
+# WORKFLOW RULES — control when a pipeline is created at all
+# =============================================================================
+workflow:
+  rules:
+    # Run for merge requests (merge request pipelines)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Run for pushes to any branch
+    - if: '$CI_COMMIT_BRANCH'
+    # Run for tags (releases)
+    - if: '$CI_COMMIT_TAG'
+    # Run when triggered manually from the UI or via API/schedule
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "api"'
+
+# #############################################################################
+# STAGE: pre-check
+# Sanity checks before anything expensive runs. Fail fast!
+# #############################################################################
+
+validate-pipeline-config:
+  stage: pre-check
+  script:
+    - echo "Validating that required files exist..."
+    - echo "Checking Dockerfile...   (test -f Dockerfile)"
+    - test -f Dockerfile
+    - echo "Checking index.html...   (test -f index.html)"
+    - test -f index.html
+    - echo "All required files present."
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+check-branch-naming:
+  stage: pre-check
+  script:
+    - echo "Checking branch naming conventions..."
+    - echo "Branch '$CI_COMMIT_REF_NAME' should match e.g. 'feature/*', 'bugfix/*', 'hotfix/*' or 'main'"
+    - 'echo "Here you would run: echo $CI_COMMIT_REF_NAME | grep -E ''^(main|feature/|bugfix/|hotfix/)''"'
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != "main"'
+    - when: never
+
+check-commit-messages:
+  stage: pre-check
+  allow_failure: true   # Don't block the pipeline on commit message style
+  script:
+    - echo "Validating commit messages against Conventional Commits..."
+    - 'echo "Last commit message: $CI_COMMIT_MESSAGE"'
+    - 'echo "A real check could use ''commitlint'' or a regex like ^(feat|fix|docs|chore)(\(.+\))?: .+"'
+
+check-merge-request-metadata:
+  stage: pre-check
+  script:
+    - 'echo "Merge Request: $CI_MERGE_REQUEST_IID"'
+    - 'echo "Title:         $CI_MERGE_REQUEST_TITLE"'
+    - 'echo "Source branch: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"'
+    - 'echo "Target branch: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"'
+    - echo "Here you could verify the MR has a description, labels and an assignee via the GitLab API."
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - when: never
+
+check-changes-scope:
+  stage: pre-check
+  script:
+    - echo "Listing files changed in this commit:"
+    - echo "(git diff --name-only \$CI_COMMIT_BEFORE_SHA \$CI_COMMIT_SHA)"
+    - 'echo "This can feed ''monorepo'' logic: only build what changed."'
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+# #############################################################################
+# STAGE: security
+# Shift-left security scanning. Runs early so vulnerabilities are caught
+# before build/deploy. Most jobs are allowed to fail in this demo.
+# #############################################################################
+
+secret-detection:
+  stage: security
+  script:
+    - echo "Scanning repository for accidentally committed secrets..."
+    - echo "Real options:"
+    - 'echo "  - GitLab built-in:   include template ''Jobs/Secret-Detection.gitlab-ci.yml''"'
+    - echo "  - gitleaks detect --source ."
+    - echo "  - trufflehog filesystem ."
+    - echo "Found 0 potential secrets (demo)."
+
+dependency-scanning:
+  stage: security
+  allow_failure: true
+  script:
+    - echo "Scanning dependencies for known vulnerabilities (CVEs)..."
+    - 'echo "Real options: GitLab Dependency-Scanning template, ''npm audit'', ''trivy fs .'', OWASP Dependency-Check"'
+    - 'echo "Would fail the pipeline (allow_failure: false) on CRITICAL findings in production."'
+
+sast-static-analysis:
+  stage: security
+  allow_failure: true
+  script:
+    - echo "Running Static Application Security Testing (SAST)..."
+    - 'echo "Real options: GitLab SAST template, semgrep, bandit (python), eslint-plugin-security (js)"'
+    - echo "Analyzing HTML/JS in index.html for XSS-prone patterns (demo)."
+
+container-scanning:
+  stage: security
+  allow_failure: true
+  script:
+    - echo "Scanning the base image defined in the Dockerfile for vulnerabilities..."
+    - 'echo "Base image: nginx:1.31.6"'
+    - 'echo "Real options: ''trivy image nginx:1.31.6'', GitLab Container-Scanning template, grype"'
+    - 'echo "Tip: pin base images by digest for reproducible, auditable builds."'
+
+dast-placeholder:
+  stage: security
+  script:
+    - echo "Dynamic Application Security Testing (DAST) usually runs against a live environment."
+    - echo "See the 'smoke' stage for where a DAST job against staging would typically live."
+  rules:
+    - when: manual   # Expensive — only run on demand
+      allow_failure: true
+
+# #############################################################################
+# STAGE: lint
+# Code quality and style checks. Cheap and fast — run before building.
+# #############################################################################
+
+lint-dockerfile:
+  stage: lint
+  script:
+    - echo "Linting Dockerfile with hadolint..."
+    - 'echo "Real command: docker run --rm -i hadolint/hadolint < Dockerfile"'
+    - 'echo "Checks: pin versions, use COPY not ADD, don''t run as root, combine RUN layers..."'
+    - 'echo "hadolint result: 0 errors, 0 warnings (demo)"'
+
+lint-html:
+  stage: lint
+  script:
+    - echo "Linting HTML files..."
+    - 'echo "Real command: npx htmlhint index.html  (or vnu.Nu validator)"'
+    - cat index.html
+    - echo "HTML is valid (demo)."
+
+lint-yaml:
+  stage: lint
+  script:
+    - echo "Validating all YAML files in the repo..."
+    - 'echo "Real command: yamllint .  or  python -c ''import yaml,sys; yaml.safe_load(...)''"'
+    - echo "GitLab also validates .gitlab-ci.yml via the CI Lint API:"
+    - echo "  curl --data-urlencode content@.gitlab-ci.yml \$CI_API_V4_URL/projects/\$CI_PROJECT_ID/ci/lint"
+
+lint-shell-scripts:
+  stage: lint
+  script:
+    - echo "Checking shell scripts with shellcheck (if any exist)..."
+    - 'echo "Real command: find . -name ''*.sh'' -exec shellcheck {} +"'
+    - echo "No shell scripts found — skipping (demo)."
+
+code-quality-report:
+  stage: lint
+  script:
+    - echo "Generating a Code Quality report (Code Climate format)..."
+    - echo "GitLab can display codequality reports in the MR widget."
+    - 'echo "Real option: include template ''Jobs/Code-Quality.gitlab-ci.yml''"'
+    # Produce a (empty but valid) codequality artifact as an example
+    - echo "[]" > codequality.json
+  artifacts:
+    reports:
+      codequality: codequality.json   # Shown in merge request diffs!
+    expire_in: 1 week
+
+# #############################################################################
+# STAGE: build
+# Compile / package the application. Here: build the Docker image.
+# #############################################################################
+
+build-assets:
+  stage: build
+  script:
+    - echo "Preparing static assets for the build..."
+    - mkdir -p dist
+    - cp index.html dist/
+    - 'echo "In a frontend project this would be: npm ci && npm run build"'
+    - echo "Build metadata:"
+    - echo "  version=$CI_COMMIT_SHORT_SHA" > dist/build-info.txt
+    - echo "  built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> dist/build-info.txt
+    - echo "  pipeline=$CI_PIPELINE_ID" >> dist/build-info.txt
+    - cat dist/build-info.txt
+  artifacts:
+    paths:
+      - dist/                 # Pass 'dist' to later stages
+    expire_in: 1 day          # Don't keep build artifacts forever
+
+build-docker-image:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind          # Docker-in-Docker: run docker build inside CI
+  needs: ["build-assets"]     # DAG: start as soon as assets exist, don't wait for whole 'build' stage
+  before_script:
+    - echo "Logging into GitLab Container Registry..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo "Building Docker image $IMAGE_NAME:$IMAGE_TAG ..."
+    - 'echo "Real command: docker build --pull -t \$IMAGE_NAME:\$IMAGE_TAG -t \$IMAGE_NAME:latest ."'
+    - docker build --pull
+      --cache-from "$IMAGE_NAME:latest"
+      -t "$IMAGE_NAME:$IMAGE_TAG"
+      -t "$IMAGE_NAME:latest"
+      .
+    - echo "Pushing image to the registry..."
+    - docker push "$IMAGE_NAME:$IMAGE_TAG"
+    - docker push "$IMAGE_NAME:latest"
+    - 'echo "Image published: $IMAGE_NAME:$IMAGE_TAG"'
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# #############################################################################
+# STAGE: test
+# Automated tests at multiple levels.
+# #############################################################################
+
+unit-tests:
+  stage: test
+  script:
+    - echo "Running unit tests..."
+    - 'echo "Real options: npm test (jest/vitest), pytest, go test ./..., dotnet test"'
+    - 'echo "Test run: 42 passed, 0 failed (demo)"'
+    # JUnit-style XML reports are picked up by GitLab and shown in the MR!
+    - mkdir -p reports
+    - |
+      cat > reports/junit.xml << 'XML'
+      <?xml version="1.0" encoding="UTF-8"?>
+      <testsuite name="unit" tests="3" failures="0" errors="0" skipped="0">
+        <testcase classname="index" name="renders hello world" time="0.01"/>
+        <testcase classname="index" name="contains h1 tag" time="0.02"/>
+        <testcase classname="dockerfile" name="uses nginx base image" time="0.01"/>
+      </testsuite>
+      XML
+  artifacts:
+    reports:
+      junit: reports/junit.xml   # Test results appear in the MR / pipeline UI
+    when: always                 # Upload even when tests fail
+    expire_in: 1 week
+
+integration-tests:
+  stage: test
+  script:
+    - echo "Running integration tests against a locally started container..."
+    - echo "Real example:"
+    - echo "  docker run -d --name app -p 8080:80 \$IMAGE_NAME:\$IMAGE_TAG"
+    - echo "  curl -f http://localhost:8080 | grep 'Hello World'"
+    - echo "  docker rm -f app"
+    - 'echo "Integration tests: 5 passed (demo)"'
+
+accessibility-tests:
+  stage: test
+  allow_failure: true
+  script:
+    - echo "Running accessibility checks (WCAG)..."
+    - 'echo "Real options: axe-core, pa11y-ci \$STAGING_URL, lighthouse-ci"'
+    - echo "Found 0 critical accessibility violations (demo)."
+
+coverage-report:
+  stage: test
+  # GitLab parses this regex from job output to display coverage in the MR badge
+  coverage: '/Coverage: \d+\.\d+%/'
+  script:
+    - echo "Measuring code coverage..."
+    - 'echo "Real options: jest --coverage, pytest --cov, nyc"'
+    - 'echo "Coverage: 87.50%"'
+
+# #############################################################################
+# STAGE: release
+# Create versioned, immutable artifacts + a GitLab Release. Tag pipelines only.
+# #############################################################################
+
+tag-release-image:
+  stage: release
+  image: docker:27
+  services:
+    - docker:27-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo "Retagging image $IMAGE_NAME:$IMAGE_TAG as release $CI_COMMIT_TAG ..."
+    - docker pull "$IMAGE_NAME:latest"
+    - docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$CI_COMMIT_TAG"
+    - docker push "$IMAGE_NAME:$CI_COMMIT_TAG"
+    - 'echo "Release image: $IMAGE_NAME:$CI_COMMIT_TAG"'
+  rules:
+    - if: '$CI_COMMIT_TAG'    # Only when a git tag is pushed
+
+create-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - echo "Creating GitLab Release for tag $CI_COMMIT_TAG ..."
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "Release $CI_COMMIT_TAG"
+    description: "Automated release created by pipeline $CI_PIPELINE_URL"
+  rules:
+    - if: '$CI_COMMIT_TAG'
+
+# #############################################################################
+# STAGE: deploy-staging
+# Auto-deploy every main-branch commit to staging.
+# #############################################################################
+
+deploy-staging:
+  stage: deploy-staging
+  script:
+    - echo "Deploying $IMAGE_NAME:$IMAGE_TAG to STAGING..."
+    - echo "Real options:"
+    - 'echo "  SSH:      ssh deploy@staging ''docker pull ... && docker compose up -d''"'
+    - 'echo "  K8s:      kubectl set image deployment/web web=\$IMAGE_NAME:\$IMAGE_TAG"'
+    - 'echo "  Helm:     helm upgrade --install web ./chart --set image.tag=\$IMAGE_TAG"'
+    - 'echo "  AWS ECS:  aws ecs update-service --service web --force-new-deployment"'
+    - echo "Deployment to staging finished."
+  environment:
+    name: staging
+    url: https://staging.example.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+
+verify-staging-deployment:
+  stage: deploy-staging
+  needs: ["deploy-staging"]
+  script:
+    - echo "Waiting for staging rollout to complete..."
+    - 'echo "Real command: kubectl rollout status deployment/web --timeout=120s"'
+    - echo "Checking $STAGING_URL returns HTTP 200..."
+    - echo "(curl --fail --retry 5 --retry-delay 5 \$STAGING_URL)"
+    - echo "Staging is healthy (demo)."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+
+# #############################################################################
+# STAGE: deploy-prod
+# Production deployment — MANUAL gate + optional protected environment.
+# #############################################################################
+
+deploy-prod:
+  stage: deploy-prod
+  # resource_group serializes deploys: two pipelines can't deploy prod at once
+  resource_group: production
+  script:
+    - echo "Deploying $IMAGE_NAME:$IMAGE_TAG to PRODUCTION..."
+    - echo "Recording previous version for possible rollback..."
+    - echo "previous_version=unknown" > deploy.env
+    - echo "Real deployment happens here (kubectl/helm/ssh/...)"
+    - echo "Production deployment finished."
+  artifacts:
+    reports:
+      dotenv: deploy.env        # Variables become available to later jobs
+  environment:
+    name: production
+    url: https://example.com
+    # on_stop links to the teardown job below (shown as 'stop' in the UI)
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual              # <-- a human clicks 'play' to deploy prod
+    - if: '$CI_COMMIT_TAG'
+      when: manual
+
+database-migration-prod:
+  stage: deploy-prod
+  needs: ["deploy-prod"]
+  script:
+    - echo "Running database migrations..."
+    - 'echo "Real options: flyway migrate, alembic upgrade head, rails db:migrate"'
+    - 'echo "TIP: use backwards-compatible (expand/contract) migrations so rollback stays possible."'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - if: '$CI_COMMIT_TAG'
+      when: manual
+
+# #############################################################################
+# STAGE: smoke
+# Quick end-to-end verification of the live production deployment.
+# #############################################################################
+
+smoke-test-homepage:
+  stage: smoke
+  script:
+    - 'echo "Smoke test: GET $PRODUCTION_URL"'
+    - 'echo "Real command: curl --fail \$PRODUCTION_URL | grep ''Hello World''"'
+    - echo "HTTP 200, expected content found (demo)."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - if: '$CI_COMMIT_TAG'
+
+smoke-test-critical-endpoints:
+  stage: smoke
+  script:
+    - echo "Smoke-testing critical endpoints:"
+    - echo "  GET \$PRODUCTION_URL/health   -> expect 200"
+    - echo "  GET \$PRODUCTION_URL/robots.txt -> expect 200"
+    - echo "  HEAD \$PRODUCTION_URL         -> check headers (CSP, HSTS, X-Frame-Options)"
+    - echo "All endpoints OK (demo)."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+smoke-test-ssl-certificate:
+  stage: smoke
+  allow_failure: true
+  script:
+    - echo "Checking TLS certificate validity and expiry..."
+    - 'echo "Real command: echo | openssl s_client -connect example.com:443 2>/dev/null | openssl x509 -noout -dates"'
+    - echo "Certificate valid for another 300 days (demo)."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+dast-against-staging:
+  stage: smoke
+  script:
+    - echo "Running DAST (OWASP ZAP baseline) against $STAGING_URL ..."
+    - 'echo "Real command: docker run -t zaproxy/zap-stable zap-baseline.py -t \$STAGING_URL"'
+    - echo "Or include the GitLab DAST template pointed at the review/staging environment."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
+# #############################################################################
+# STAGE: performance
+# Load/performance testing — usually manual or scheduled (nightly).
+# #############################################################################
+
+performance-load-test:
+  stage: performance
+  script:
+    - echo "Running load test against $STAGING_URL ..."
+    - echo "Real options:"
+    - 'echo "  k6:      k6 run load-test.js   (vus=50, duration=5m)"'
+    - echo "  k6 cloud via GitLab template 'Verify/Browser-Performance.gitlab-ci.yml'"
+    - 'echo "  jmeter:  jmeter -n -t plan.jmx"'
+    - 'echo "Results: p95 latency 180ms, error rate 0.0% (demo)"'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'   # e.g. nightly performance runs
+
+performance-lighthouse:
+  stage: performance
+  script:
+    - echo "Running Lighthouse audit against $STAGING_URL ..."
+    - 'echo "Real command: npx lighthouse-ci autorun --collect.url=\$STAGING_URL"'
+    - 'echo "Scores: performance 98, accessibility 100, best-practices 95, SEO 100 (demo)"'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
+# #############################################################################
+# STAGE: rollback
+# Always manual. Re-deploys the last known-good version.
+# #############################################################################
+
+rollback-prod:
+  stage: rollback
+  resource_group: production    # Shares the lock with deploy-prod
+  script:
+    - echo "!!! ROLLING BACK PRODUCTION !!!"
+    - 'echo "Option A (git):     revert the bad commit and let the pipeline redeploy."'
+    - 'echo "Option B (K8s):     kubectl rollout undo deployment/web"'
+    - 'echo "Option C (image):   redeploy previous tag \$PREVIOUS_VERSION"'
+    - 'echo "Option D (GitLab):  trigger a redeploy of the last successful pipeline"'
+    - echo "                    via Environments > 'Re-deploy' or the API."
+    - echo "Rollback complete (demo)."
+  environment:
+    name: production
+    url: https://example.com
+    action: stop                # Marks this as a teardown/rollback-style action
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
+verify-rollback:
+  stage: rollback
+  needs: ["rollback-prod"]
+  script:
+    - 'echo "Verifying rollback: checking $PRODUCTION_URL serves the previous version..."'
+    - echo "(curl --fail \$PRODUCTION_URL)"
+    - echo "Rollback verified (demo)."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+
+# #############################################################################
+# STAGE: notify
+# Inform the team. Runs on success AND failure (when: always).
+# #############################################################################
+
+notify-slack:
+  stage: notify
+  script:
+    - echo "Sending notification to Slack..."
+    - echo "Real command:"
+    - 'echo "  curl -X POST -H ''Content-type: application/json'' \\"'
+    - 'echo "    --data ''{\"text\":\"Pipeline \$CI_PIPELINE_ID (\$CI_COMMIT_REF_NAME) finished with status: \$CI_JOB_STATUS\"}'' \\"'
+    - echo "    \$SLACK_WEBHOOK_URL"
+    - echo "Message sent (demo — webhook URL would be a masked CI/CD variable)."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always              # Notify on success AND failure
+      allow_failure: true
+
+notify-email-on-failure:
+  stage: notify
+  script:
+    - echo "Pipeline FAILED — sending alert email to the on-call engineer..."
+    - 'echo "Real options: GitLab pipeline notification emails, or an API call to PagerDuty/Opsgenie."'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_failure
+      allow_failure: true
+
+publish-metrics:
+  stage: notify
+  script:
+    - echo "Publishing DORA metrics (deploy frequency, lead time, change failure rate)..."
+    - echo "GitLab tracks these automatically under Analytics > CI/CD & Value Stream."
+    - 'echo "Real option: push custom metrics to Prometheus via pushgateway."'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+      allow_failure: true
+
+# #############################################################################
+# BONUS: scheduled maintenance job
+# #############################################################################
+
+nightly-cleanup:
+  stage: pre-check
+  script:
+    - echo "Nightly maintenance tasks:"
+    - echo "  - Prune old container registry images (keep last 10 tags)"
+    - echo "  - Expire old pipeline artifacts"
+    - echo "  - Refresh dependency vulnerability database"
+    - 'echo "Real option: use the GitLab API with a project access token."'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'   # Configure under CI/CD > Schedules
