@@ -1,0 +1,9 @@
+- [ ] Finish Pipeline
+- [X] Template & Includes
+- [X] Enviornments & Variables for specific envs
+- [ ] Pre-defined Variables
+- [X] Splitting the YAML files
+- [X] Making seperate pipelines in one project
+- [X] Deployment Models
+- [X] Best Practises
+- [X] evt. Define Pipeline for Scripts
